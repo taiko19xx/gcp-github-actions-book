@@ -1,0 +1,96 @@
+name: Publish to GKE
+on:
+  pull_request:
+    types: ['opened', 'reopened', 'synchronize']
+jobs:
+  main:
+    permissions:
+      id-token: 'write'
+      contents: 'read'
+    runs-on: ubuntu-latest
+    env:
+      GCLOUD_PROJECT_ID: '（プロジェクトID）'
+      GCLOUD_DNS_ZONE: '（DNSゾーン名）'
+      GCLOUD_DNS_DOMAIN: '（ドメイン）'
+      GCLOUD_WORKLOAD_IDENTITY: '（Workload Identity 連携）'
+      GCLOUD_REGION: 'asia-northeast1'
+      CLOUD_ARTIFACT_REGISTRY: '（Artifact Registry リポジトリ）'
+      DOCKER_IMAGE: 'gh-book-image'
+      GCLOUD_GKE_CLUSTER: 'github-actions-book-cluster'
+      SERVICE_NAME: 'github-actions-book-service'
+      DEPLOYMENT_NAME: 'github-actions-book-deployment'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        path: './src'
+        token: ${{ secrets.GH_TOKEN }}
+
+    - name: Get branch name
+      id: branch-name
+      uses: tj-actions/branch-names@v5
+
+    - name: Set DNS and docker image tag and namespace
+      run: | 
+        echo 'TARGET_DOMAIN=${{ steps.branch-name.outputs.current_branch }}.gke.${{ env.GCLOUD_DNS_DOMAIN }}' >> $GITHUB_ENV
+        echo 'TARGET_DOCKER_IMAGE_TAG=${{ env.CLOUD_ARTIFACT_REGISTRY }}/${{ env.DOCKER_IMAGE }}:${{ steps.branch-name.outputs.current_branch }}' >> $GITHUB_ENV
+        echo 'TARGET_NAMESPACE=${{ env.GCLOUD_PROJECT_ID }}-${{ steps.branch-name.outputs.current_branch }}' >> $GITHUB_ENV
+
+    - id: auth
+      name: Set up GoogleCloud Authorization
+      uses: google-github-actions/auth@v0
+      with:
+        token_format: 'access_token'
+        workload_identity_provider: ${{ env.GCLOUD_WORKLOAD_IDENTITY }}
+        service_account: 'github-actions@${{ env.GCLOUD_PROJECT_ID }}.iam.gserviceaccount.com'
+        access_token_lifetime: '300s'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0.3.0
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v0
+      with:
+        cluster_name: ${{ env.GCLOUD_GKE_CLUSTER }}
+        location: ${{ env.GCLOUD_REGION }}
+
+    - name: Build docker image
+      run: |
+        cd ./src
+        gcloud builds submit --config=cloudbuild.yaml --substitutions=TAG_NAME=${{ env.TARGET_DOCKER_IMAGE_TAG }}
+
+    - name: Create namespace
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        kubectl create namespace ${{ env.TARGET_NAMESPACE }}
+
+    - name: Deploy service
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        cd ./src
+        sed -e 's!DEPLOY_IMAGE!${{ env.TARGET_DOCKER_IMAGE_TAG }}!g' kubernetes.yaml | kubectl apply -n ${{ env.TARGET_NAMESPACE }} -f -
+
+    - name: Update image
+      if: ${{ github.event.action == 'synchronize' }}
+      run: |
+        kubectl rollout restart deployments/${{ env.DEPLOYMENT_NAME }} -n ${{ env.TARGET_NAMESPACE }}
+
+    - id: load_balancer
+      if: ${{ github.event.action != 'synchronize' }}
+      name: Get loadBalancer IP
+      run: |
+        result=""
+        while [ -z "$result" ]
+        do
+          result=$(kubectl get service ${{ env.SERVICE_NAME }} -n ${{ env.TARGET_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}') 
+          sleep 1s
+        done
+        echo $result
+        echo "::set-output name=ip::$result"
+
+    - name: Add DNS record
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        gcloud dns record-sets transaction start --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction add ${{ steps.load_balancer.outputs.ip }} --name='${{ env.TARGET_DOMAIN }}.' --ttl=60 --type='A' --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction execute --zone=${{ env.GCLOUD_DNS_ZONE }}

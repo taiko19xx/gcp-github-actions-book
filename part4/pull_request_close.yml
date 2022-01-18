@@ -1,0 +1,72 @@
+name: Delete deployed resources
+on:
+  pull_request:
+    types: ['closed']
+jobs:
+  main:
+    permissions:
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    env:
+      GCLOUD_PROJECT_ID: '（プロジェクトID）'
+      GCLOUD_DNS_ZONE: '（DNSゾーン名）'
+      GCLOUD_DNS_DOMAIN: '（ドメイン）'
+      GCLOUD_WORKLOAD_IDENTITY: '（Workload Identity 連携）'
+      GCLOUD_REGION: 'asia-northeast1'
+      GCLOUD_GKE_CLUSTER: 'github-actions-book-cluster'
+      SERVICE_NAME: 'github-actions-book-service'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        path: './src'
+        token: ${{ secrets.GH_TOKEN }}
+
+    - name: Get branch name
+      id: branch-name
+      uses: tj-actions/branch-names@v5
+
+    - name: Set DNS and namespace
+      run: | 
+        echo 'TARGET_DOMAIN=${{ steps.branch-name.outputs.current_branch }}.gke.${{ env.GCLOUD_DNS_DOMAIN }}' >> $GITHUB_ENV
+        echo 'TARGET_NAMESPACE=${{ env.GCLOUD_PROJECT_ID }}-${{ steps.branch-name.outputs.current_branch }}' >> $GITHUB_ENV
+
+    - id: auth
+      name: Set up GoogleCloud Authorization
+      uses: google-github-actions/auth@v0
+      with:
+        token_format: 'access_token'
+        workload_identity_provider: ${{ env.GCLOUD_WORKLOAD_IDENTITY }}
+        service_account: 'github-actions@${{ env.GCLOUD_PROJECT_ID }}.iam.gserviceaccount.com'
+        access_token_lifetime: '300s'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0.3.0
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v0
+      with:
+        cluster_name: ${{ env.GCLOUD_GKE_CLUSTER }}
+        location: ${{ env.GCLOUD_REGION }}
+
+    - id: load_balancer
+      name: Get loadBalancer IP
+      run: |
+        result=$(kubectl get service ${{ env.SERVICE_NAME }} -n ${{ env.TARGET_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}') 
+        echo $result
+        echo "::set-output name=ip::$result"
+
+    - name: Delete DNS record
+      run: |
+        gcloud dns record-sets transaction start --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction remove ${{ steps.load_balancer.outputs.ip }} --name='${{ env.TARGET_DOMAIN }}.' --ttl=60 --type='A' --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction execute --zone=${{ env.GCLOUD_DNS_ZONE }}
+
+    - name: Delete resources
+      run: |
+        cd ./src
+        kubectl delete -n ${{ env.TARGET_NAMESPACE }} -f kubernetes.yaml
+
+    - name: Delete namespace
+      run: |
+        kubectl delete namespace ${{ env.TARGET_NAMESPACE }}

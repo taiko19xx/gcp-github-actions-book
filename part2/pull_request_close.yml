@@ -1,0 +1,52 @@
+name: Delete deployed resources
+on:
+  pull_request:
+    types: ['closed']
+jobs:
+  main:
+    permissions:
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    env:
+      GCLOUD_PROJECT_ID: '（プロジェクトID）'
+      GCLOUD_DNS_ZONE: '（DNSゾーン名）'
+      GCLOUD_DNS_DOMAIN: '（ドメイン）'
+      GCLOUD_WORKLOAD_IDENTITY: '（Workload Identity 連携）'
+    steps:
+    - name: Get branch name
+      id: branch-name
+      uses: tj-actions/branch-names@v5
+
+    - name: Set DNS and bucket name
+      run: echo 'TARGET_DOMAIN=${{ steps.branch-name.outputs.current_branch }}.storage.${{ env.GCLOUD_DNS_DOMAIN }}' >> $GITHUB_ENV
+
+    - id: auth
+      name: Set up GoogleCloud Authorization
+      uses: google-github-actions/auth@v0
+      with:
+        token_format: 'access_token'
+        workload_identity_provider: ${{ env.GCLOUD_WORKLOAD_IDENTITY }}
+        service_account: 'github-actions@${{ env.GCLOUD_PROJECT_ID }}.iam.gserviceaccount.com'
+        access_token_lifetime: '300s'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0.3.0
+
+    - name: Purge exist files
+      run: |
+        yes | gcloud components install alpha
+        gcloud alpha storage rm gs://${{ env.TARGET_DOMAIN }}/**
+
+    - name: Delete bucket
+      run: |
+        curl --request DELETE \
+          'https://storage.googleapis.com/storage/v1/b/${{ env.TARGET_DOMAIN }}' \
+          --header 'Authorization: Bearer ${{ steps.auth.outputs.access_token }}' \
+          --header 'Content-Type: application/json'
+
+    - name: Delete DNS record
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        gcloud dns record-sets transaction start --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction remove c.storage.googleapis.com. --name='${{ env.TARGET_DOMAIN }}.' --ttl='60' --type='CNAME' --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction execute --zone=${{ env.GCLOUD_DNS_ZONE }}

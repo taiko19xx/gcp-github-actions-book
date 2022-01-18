@@ -1,0 +1,76 @@
+name: Publish to Cloud Run
+on:
+  pull_request:
+    types: ['opened', 'reopened', 'synchronize']
+jobs:
+  main:
+    permissions:
+      id-token: 'write'
+      contents: 'read'
+    runs-on: ubuntu-latest
+    env:
+      GCLOUD_PROJECT_ID: '（プロジェクトID）'
+      GCLOUD_DNS_ZONE: '（DNSゾーン名）'
+      GCLOUD_DNS_DOMAIN: '（ドメイン）'
+      GCLOUD_WORKLOAD_IDENTITY: '（Workload Identity 連携）'
+      GCLOUD_REGION: 'asia-northeast1'
+      CLOUD_ARTIFACT_REGISTRY: '（Artifact Registry リポジトリ）'
+      DOCKER_IMAGE: 'gh-book-image'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        path: './src'
+        token: ${{ secrets.GH_TOKEN }}
+
+    - name: Get branch name
+      id: branch-name
+      uses: tj-actions/branch-names@v5
+
+    - name: Set DNS and docker image tag
+      run: | 
+        echo 'TARGET_DOMAIN=${{ steps.branch-name.outputs.current_branch }}.run.${{ env.GCLOUD_DNS_DOMAIN }}' >> $GITHUB_ENV
+        echo 'TARGET_DOCKER_IMAGE_TAG=${{ env.CLOUD_ARTIFACT_REGISTRY }}/${{ env.DOCKER_IMAGE }}:${{ steps.branch-name.outputs.current_branch }}' >> $GITHUB_ENV
+
+    - id: auth
+      name: Set up GoogleCloud Authorization
+      uses: google-github-actions/auth@v0
+      with:
+        token_format: 'access_token'
+        workload_identity_provider: ${{ env.GCLOUD_WORKLOAD_IDENTITY }}
+        service_account: 'github-actions@${{ env.GCLOUD_PROJECT_ID }}.iam.gserviceaccount.com'
+        access_token_lifetime: '300s'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v0.3.0
+
+    - name: Build docker image
+      run: |
+        cd ./src
+        gcloud builds submit --config=cloudbuild.yaml --substitutions=TAG_NAME=${{ env.TARGET_DOCKER_IMAGE_TAG }}
+
+    - name: Deploy cloud run
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        gcloud run deploy ${{ steps.branch-name.outputs.current_branch }} --image=${{ env.TARGET_DOCKER_IMAGE_TAG }} --region=${{ env.GCLOUD_REGION }} --allow-unauthenticated
+
+    - name: Update cloud run
+      if: ${{ github.event.action == 'synchronize' }}
+      run: |
+        gcloud run services update ${{ steps.branch-name.outputs.current_branch }} --image=${{ env.TARGET_DOCKER_IMAGE_TAG }} --region=${{ env.GCLOUD_REGION }}
+
+    - id: mapping
+      if: ${{ github.event.action != 'synchronize' }}
+      name: Set up domain-mapping
+      run: |
+        yes | gcloud components install beta
+        result=$(gcloud beta run domain-mappings create --service=${{ steps.branch-name.outputs.current_branch }} --domain=${{ env.TARGET_DOMAIN }} --region=${{ env.GCLOUD_REGION }} --format=json | jq -c '.[0]')
+        echo $result
+        echo "::set-output name=mapping::$result"
+
+    - name: Add DNS record
+      if: ${{ github.event.action != 'synchronize' }}
+      run: |
+        gcloud dns record-sets transaction start --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction add ${{ fromJSON(steps.mapping.outputs.mapping).rrdata }} --name='${{ fromJSON(steps.mapping.outputs.mapping).name }}.${{ env.GCLOUD_DNS_DOMAIN }}.' --ttl=60 --type=${{ fromJSON(steps.mapping.outputs.mapping).type }} --zone=${{ env.GCLOUD_DNS_ZONE }} 
+        gcloud dns record-sets transaction execute --zone=${{ env.GCLOUD_DNS_ZONE }}
